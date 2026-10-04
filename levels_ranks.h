@@ -95,6 +95,7 @@ public:
 	bool Unload(char* error, size_t maxlen);
 	void AllPluginsLoaded();
 	void* OnMetamodQuery(const char* iface, int* ret);
+	void OnPluginUnload(PluginId id);
 	void OnClientPutInServer(CPlayerSlot slot, char const *pszName, int type, uint64 xuid);
 private:
 	const char* GetAuthor();
@@ -281,7 +282,33 @@ public:
 			}
 		}
 	}
+
+	// Forgets every callback registered by an unloading plugin.
+	void RemovePluginHooks(int id) {
+		DropPluginHooks(CoreReadyHook, id);
+		DropPluginHooks(OnLevelChangedPreHook, id);
+		DropPluginHooks(OnLevelChangedPostHook, id);
+		DropPluginHooks(OnPlayerKilledPreHook, id);
+		DropPluginHooks(OnPlayerKilledPostHook, id);
+		DropPluginHooks(OnPlayerLoadedHook, id);
+		DropPluginHooks(OnResetPlayerStatsHook, id);
+		DropPluginHooks(OnPlayerPosInTopHook, id);
+		DropPluginHooks(OnExpChangedPreHook, id);
+		DropPluginHooks(OnExpChangedPostHook, id);
+		DropPluginHooks(OnDatabaseCleanupHook, id);
+	}
 private:
+	// The callbacks' code lives in the unloading plugin and may already be unmapped,
+	// and std::function's destructor calls into that code. Move them out and leak
+	// them instead of destroying them; erasing the emptied vector destroys nothing.
+	template <typename T>
+	static void DropPluginHooks(std::map<int, std::vector<T>> &hooks, int id) {
+		auto it = hooks.find(id);
+		if (it == hooks.end()) return;
+		new std::vector<T>(std::move(it->second));
+		hooks.erase(it);
+	}
+
 	bool bActive = false;
 
 	std::map<int, std::vector<OnCoreIsReady>> 		CoreReadyHook;

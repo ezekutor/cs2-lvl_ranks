@@ -1237,12 +1237,25 @@ bool LR::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
 
 bool LR::Unload(char *error, size_t maxlen)
 {
+	// Utils keeps our event, command and map-start callbacks; drop them before
+	// this library is unmapped.
+	if (g_pUtils)
+		g_pUtils->ClearAllHooks(g_PLID);
+
 	SH_REMOVE_HOOK_MEMFUNC(IServerGameClients, ClientPutInServer, g_pSource2GameClients, this, &LR::OnClientPutInServer, true);
 	SH_REMOVE_HOOK_MEMFUNC(IServerGameClients, ClientDisconnect, g_pSource2GameClients, this, &LR::OnClientDisconnect, true);
 
 	ConVar_Unregister();
 	
 	return true;
+}
+
+// Modules cannot unhook from the core, so forget the callbacks of an unloaded
+// plugin here; the next event would otherwise call into its unmapped code.
+void LR::OnPluginUnload(PluginId id)
+{
+	if (g_pLRApi)
+		g_pLRApi->RemovePluginHooks(id);
 }
 
 void LR::OnClientDisconnect( CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 xuid, const char *pszNetworkID )
