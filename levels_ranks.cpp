@@ -3,6 +3,7 @@
 #include "metamod_oslink.h"
 #include "schemasystem/schemasystem.h"
 #include <fstream>
+#include <iterator>
 
 LR g_LR;
 PLUGIN_EXPOSE(LR, g_LR);
@@ -37,6 +38,7 @@ int g_iBonus[10];
 
 int g_iDBCountPlayers = 0;
 bool g_bAllowStatistic;
+bool g_bDisabled = false;
 
 IMySQLClient *g_pMysqlClient;
 IMySQLConnection* g_pConnection;
@@ -93,7 +95,23 @@ CGameEntitySystem* GameEntitySystem()
 	return g_pUtils->GetCGameEntitySystem();
 };
 
-void LoadConfig()
+// Stops the core without unloading it. A self-unload left Utils and sql_mm holding
+// callbacks into the unmapped library and modules holding a dangling g_pLRCore.
+void DisableCore()
+{
+	if (g_bDisabled)
+		return;
+
+	g_bDisabled = true;
+	if (g_pLRApi)
+		g_pLRApi->SetActive(false);
+	if (g_pUtils)
+		g_pUtils->ClearAllHooks(g_PLID);
+	ConColorMsg(Color(255, 0, 0, 255), "[%s] Core is disabled, see the error log\n", g_PLAPI->GetLogTag());
+}
+
+// Writes straight into the globals; LoadConfig() restores them if this fails halfway.
+bool ReadConfig()
 {
 	{
 		KeyValues::AutoDelete g_kvPhrases("Phrases");
@@ -102,9 +120,7 @@ void LoadConfig()
 		if (!g_kvPhrases->LoadFromFile(g_pFullFileSystem, pszPath))
 		{
 			g_pUtils->ErrorLog("[%s] Failed to load %s", g_PLAPI->GetLogTag(), pszPath);
-			std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-			engine->ServerCommand(sBuffer.c_str());
-			return;
+			return false;
 		}
 
 		const char* g_pszLanguage = g_pUtils->GetLanguage();
@@ -118,9 +134,7 @@ void LoadConfig()
 		if (!g_kvPhrasesRanks->LoadFromFile(g_pFullFileSystem, pszPath2))
 		{
 			g_pUtils->ErrorLog("[%s] Failed to load %s", g_PLAPI->GetLogTag(), pszPath2);
-			std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-			engine->ServerCommand(sBuffer.c_str());
-			return;
+			return false;
 		}
 
 		for (KeyValues *pKey = g_kvPhrasesRanks->GetFirstTrueSubKey(); pKey; pKey = pKey->GetNextTrueSubKey())
@@ -133,9 +147,7 @@ void LoadConfig()
 
 		if (!pKVConfig->LoadFromFile(g_pFullFileSystem, "addons/configs/levels_ranks/settings.ini")) {
 			g_pUtils->ErrorLog("[%s] Failed to load levels ranks config 'addons/config/levels_ranks/settings.ini'", g_PLAPI->GetLogTag());
-			std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-			engine->ServerCommand(sBuffer.c_str());
-			return;
+			return false;
 		}
 		int iTypeStatistics;
 		KeyValues* pKVConfigMain = pKVConfig->FindKey("MainSettings", false);
@@ -179,9 +191,7 @@ void LoadConfig()
 		else
 		{
 			g_pUtils->ErrorLog("[%s] Not found MainSettings in levels ranks config", g_PLAPI->GetLogTag());
-			std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-			engine->ServerCommand(sBuffer.c_str());
-			return;
+			return false;
 		}
 
 		switch(iTypeStatistics)
@@ -192,9 +202,7 @@ void LoadConfig()
 				if(!pKVConfigMain)
 				{
 					g_pUtils->ErrorLog("[%s] Not found Funded_System in levels ranks config", g_PLAPI->GetLogTag());
-					std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-					engine->ServerCommand(sBuffer.c_str());
-					return;
+					return false;
 				}
 
 				g_SettingsStats[LR_ExpKill] = pKVConfigMain->GetInt("lr_kill");
@@ -210,9 +218,7 @@ void LoadConfig()
 				if(!pKVConfigMain)
 				{
 					g_pUtils->ErrorLog("[%s] Not found Rating_Extended in levels ranks config", g_PLAPI->GetLogTag());
-					std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-					engine->ServerCommand(sBuffer.c_str());
-					return;
+					return false;
 				}
 
 				float flKillCoefficient = pKVConfigMain->GetFloat("lr_killcoeff", 1.0);
@@ -236,9 +242,7 @@ void LoadConfig()
 				if(!pKVConfigMain)
 				{
 					g_pUtils->ErrorLog("[%s] Not found Rating_Simple in levels ranks config", g_PLAPI->GetLogTag());
-					std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-					engine->ServerCommand(sBuffer.c_str());
-					return;
+					return false;
 				}
 				break;
 			}
@@ -274,9 +278,7 @@ void LoadConfig()
 			else
 			{
 				g_pUtils->ErrorLog("[%s] Not found Special_Bonuses in levels ranks config", g_PLAPI->GetLogTag());
-				std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-				engine->ServerCommand(sBuffer.c_str());
-				return;
+				return false;
 			}
 		}
 
@@ -295,11 +297,40 @@ void LoadConfig()
 		else
 		{
 			g_pUtils->ErrorLog("[%s] Not found Ranks in levels ranks config", g_PLAPI->GetLogTag());
-			std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-			engine->ServerCommand(sBuffer.c_str());
-			return;
+			return false;
 		}
 	}
+	return true;
+}
+
+// A broken file on the admin-menu reload keeps the running settings instead of
+// leaving them half-overwritten.
+bool LoadConfig()
+{
+	std::map<std::string, std::string> vecPhrases = g_vecPhrases;
+	char sPluginTitle[sizeof(g_sPluginTitle)], sTableName[sizeof(g_sTableName)];
+	int Settings[std::size(g_Settings)], SettingsStats[std::size(g_SettingsStats)], iBonus[std::size(g_iBonus)];
+	std::vector<std::string> hRankNames = g_hRankNames;
+	std::vector<int> hRankExp = g_hRankExp;
+
+	memcpy(sPluginTitle, g_sPluginTitle, sizeof(sPluginTitle));
+	memcpy(sTableName, g_sTableName, sizeof(sTableName));
+	memcpy(Settings, g_Settings, sizeof(Settings));
+	memcpy(SettingsStats, g_SettingsStats, sizeof(SettingsStats));
+	memcpy(iBonus, g_iBonus, sizeof(iBonus));
+
+	if (ReadConfig())
+		return true;
+
+	g_vecPhrases.swap(vecPhrases);
+	memcpy(g_sPluginTitle, sPluginTitle, sizeof(sPluginTitle));
+	memcpy(g_sTableName, sTableName, sizeof(sTableName));
+	memcpy(g_Settings, Settings, sizeof(Settings));
+	memcpy(g_SettingsStats, SettingsStats, sizeof(SettingsStats));
+	memcpy(g_iBonus, iBonus, sizeof(iBonus));
+	g_hRankNames.swap(hRankNames);
+	g_hRankExp.swap(hRankExp);
+	return false;
 }
 
 void OnLRMenu(int iSlot);
@@ -1000,8 +1031,14 @@ void MenuAdmin(int iSlot)
 			{
 				case 0:
 				{
-					LoadConfig();
-					g_pUtils->PrintToChat(iSlot, g_vecPhrases[std::string("ConfigUpdated")].c_str());
+					if (LoadConfig())
+						g_pUtils->PrintToChat(iSlot, g_vecPhrases[std::string("ConfigUpdated")].c_str());
+					else
+					{
+						// An older phrases file has no such phrase.
+						const std::string& sFailed = g_vecPhrases[std::string("ConfigUpdateFailed")];
+						g_pUtils->PrintToChat(iSlot, sFailed.empty() ? "[LR] Config reload failed, see the error log" : sFailed.c_str());
+					}
 					OnLRMenu(iSlot);
 					break;
 				}
@@ -1145,6 +1182,12 @@ CON_COMMAND_F(mm_lvl_give_admin, "Give admin", FCVAR_GAMEDLL)
 
 CON_COMMAND_F(mm_lvl_reset, "Reset player statistics", FCVAR_GAMEDLL)
 {
+	if(g_bDisabled || !g_pConnection)
+	{
+		Msg("[LR] Core is disabled\n");
+		return;
+	}
+
 	if(args.ArgC() > 1)
 	{
 		int iType = -1;
@@ -1262,7 +1305,8 @@ void LR::OnClientDisconnect( CPlayerSlot slot, ENetworkDisconnectionReason reaso
 {
 	int iSlot = slot.Get();
 	g_bAdminAccess[iSlot] = false;
-	SaveDataPlayer(iSlot, true);
+	if (!g_bDisabled)
+		SaveDataPlayer(iSlot, true);
 }
 
 void LR::OnClientPutInServer(CPlayerSlot slot, char const *pszName, int type, uint64 xuid)
@@ -1272,6 +1316,8 @@ void LR::OnClientPutInServer(CPlayerSlot slot, char const *pszName, int type, ui
 	g_iPlayerInfo[iSlot] = g_iInfoNULL;
 	if (iSlot == -1)
     	return;
+	if (g_bDisabled || !g_pConnection)
+		return;
 
 	CCSPlayerController* pPlayerController = CCSPlayerController::FromSlot(iSlot);
 	if (!pPlayerController || pPlayerController->m_steamID() <= 0)
@@ -1671,8 +1717,7 @@ void LR::AllPluginsLoaded()
 	{
 		V_strncpy(error, "Missing Utils system plugin", 64);
 		ConColorMsg(Color(255, 0, 0, 255), "[%s] %s\n", GetLogTag(), error);
-		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		DisableCore();
 		return;
 	}
 
@@ -1680,8 +1725,7 @@ void LR::AllPluginsLoaded()
 	if (ret == META_IFACE_FAILED)
 	{
 		g_pUtils->ErrorLog("[%s] Missing Utils plugin", GetLogTag());
-		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		DisableCore();
 		return;
 	}
 
@@ -1689,8 +1733,7 @@ void LR::AllPluginsLoaded()
 	if (ret == META_IFACE_FAILED)
 	{
 		g_pUtils->ErrorLog("[%s] Missing Utils plugin", GetLogTag());
-		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		DisableCore();
 		return;
 	}
 
@@ -1705,8 +1748,7 @@ void LR::AllPluginsLoaded()
 	if (ret == META_IFACE_FAILED)
 	{
 		g_pUtils->ErrorLog("[%s] Missing SQL plugin", GetLogTag());
-		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		DisableCore();
 		return;
 	}
 	g_pMysqlClient = pSqlInterface->GetMySQLClient();
@@ -1714,21 +1756,23 @@ void LR::AllPluginsLoaded()
 	g_pUtils->StartupServer(g_PLID, StartupServer);
 	g_pUtils->OnGetGameRules(g_PLID, GetGameRules);
 
-	LoadConfig();
+	if (!LoadConfig())
+	{
+		DisableCore();
+		return;
+	}
 	KeyValues* pKVConfig = new KeyValues("Databases");
 
 	if (!pKVConfig->LoadFromFile(g_pFullFileSystem, "addons/configs/databases.cfg")) {
 		g_pUtils->ErrorLog("[%s] Failed to load databases config 'addons/config/databases.cfg'", GetLogTag());
-		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		DisableCore();
 		return;
 	}
 
 	pKVConfig = pKVConfig->FindKey("levels_ranks", false);
 	if (!pKVConfig) {
 		g_pUtils->ErrorLog("[%s] Not found `levels_ranks` in databases config", GetLogTag());
-		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		DisableCore();
 		return;
 	}
 
@@ -1743,8 +1787,7 @@ void LR::AllPluginsLoaded()
 	g_pConnection->Connect([](bool connect) {
 		if (!connect) {
 			g_pUtils->ErrorLog("[%s] Failed to connect to the database", g_PLAPI->GetLogTag());
-			std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-			engine->ServerCommand(sBuffer.c_str());
+			DisableCore();
 		} else {
 			char szQuery[1024];
 			g_SMAPI->Format(szQuery, sizeof(szQuery), "CREATE TABLE IF NOT EXISTS `%s` \

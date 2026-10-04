@@ -88,6 +88,16 @@
 		"de"		"Konfigurationseinstellungen aktualisiert"
 		"pt"		"Configurações atualizada"
 	}
+	"ConfigUpdateFailed"
+	{
+		"en"		"Configuration not updated: settings file has errors, see the error log"
+		"ru"		"Конфигурация не обновлена: в файле настроек ошибка, смотрите лог ошибок"
+		"ua"		"Конфігурацію не оновлено: у файлі налаштувань помилка, дивіться журнал помилок"
+		"chi"		"配置未更新：设置文件有错误，请查看错误日志"
+		"es"		"Configuración no actualizada: el archivo de ajustes tiene errores, revise el registro de errores"
+		"de"		"Konfiguration nicht aktualisiert: Einstellungsdatei fehlerhaft, siehe Fehlerprotokoll"
+		"pt"		"Configuração não atualizada: o arquivo de configurações tem erros, veja o log de erros"
+	}
 	"GiveTakeMenuExp"
 	{
 		"en"		"Give/Take Exp. Points"
