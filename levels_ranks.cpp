@@ -3,6 +3,8 @@
 #include "metamod_oslink.h"
 #include "schemasystem/schemasystem.h"
 #include <fstream>
+#include <cerrno>
+#include <cstdint>
 #include <iterator>
 
 LR g_LR;
@@ -58,7 +60,9 @@ bool g_bAdminAccess[64];
 SH_DECL_HOOK4_void(IServerGameClients, ClientPutInServer, SH_NOATTRIB, 0, CPlayerSlot, char const *, int, uint64);
 SH_DECL_HOOK5_void(IServerGameClients, ClientDisconnect, SH_NOATTRIB, 0, CPlayerSlot, ENetworkDisconnectionReason, const char *, uint64, const char *);
 
+// Returns an empty string when the ID has no numeric account part (bots, pending IDs).
 std::string ConvertSteamID(const char* usteamid) {
+    if (!usteamid) return "";
     std::string steamid(usteamid);
 
     steamid.erase(std::remove(steamid.begin(), steamid.end(), '['), steamid.end());
@@ -72,9 +76,15 @@ std::string ConvertSteamID(const char* usteamid) {
         usteamid_split.push_back(token);
     }
 
+    if (usteamid_split.size() < 3 || usteamid_split[2].empty()) return "";
+
     std::string steamid_parts[3] = { "STEAM_1:", "", "" };
 
-    int z = std::stoi(usteamid_split[2]);
+    // Account IDs are unsigned 32-bit; std::stoi throws above INT_MAX and on junk.
+    char* pEnd = nullptr;
+    errno = 0;
+    unsigned long long z = std::strtoull(usteamid_split[2].c_str(), &pEnd, 10);
+    if (*pEnd != '\0' || errno == ERANGE || z > UINT32_MAX) return "";
 
     if (z % 2 == 0) {
         steamid_parts[1] = "0:";
@@ -82,7 +92,7 @@ std::string ConvertSteamID(const char* usteamid) {
         steamid_parts[1] = "1:";
     }
 
-    int steamacct = z / 2;
+    unsigned long long steamacct = z / 2;
     steamid_parts[2] = std::to_string(steamacct);
 
     std::string result = steamid_parts[0] + steamid_parts[1] + steamid_parts[2];
@@ -94,6 +104,11 @@ CGameEntitySystem* GameEntitySystem()
 {
 	return g_pUtils->GetCGameEntitySystem();
 };
+
+bool IsValidSlot(int iSlot)
+{
+	return iSlot >= 0 && iSlot < 64;
+}
 
 // Stops the core without unloading it. A self-unload left Utils and sql_mm holding
 // callbacks into the unmapped library and modules holding a dangling g_pLRCore.
@@ -402,6 +417,10 @@ void ClientPrint(int iSlot, const char *msg, ...)
 
 bool CheckStatus(int iSlot)
 {
+	// Events report -1 for "nobody", and FromSlot(-1) returns the world entity.
+	if (!IsValidSlot(iSlot))
+		return false;
+
 	CCSPlayerController* pPlayerController = CCSPlayerController::FromSlot(iSlot);
 	if (!pPlayerController || !pPlayerController->m_hPawn() || pPlayerController->m_steamID() <= 0)
 		return false;
@@ -425,10 +444,11 @@ void ResetPlayerData(int iSlot)
 
 void SaveDataPlayer(int iSlot, bool bDisconnect = false)
 {
-	if(CheckStatus(iSlot))
+	if(g_pConnection && CheckStatus(iSlot))
 	{
 		char szQuery[1024];
 		int iTime = std::time(0);
+		const char* szName = engine->GetClientConVarValue(iSlot, "name");
 		g_SMAPI->Format(szQuery, sizeof(szQuery), "REPLACE INTO `%s` \
 		(\
 			`steam`, \
@@ -447,7 +467,7 @@ void SaveDataPlayer(int iSlot, bool bDisconnect = false)
 			`lastconnect`, \
 			`online` \
 		) \
-		VALUES ('%s', %i, '%s', %i, %i, %i, %i, %i, %i, %i, %i, %i, %i, %i, %i);", g_sTableName, g_iPlayerInfo[iSlot].szAuth.c_str(), g_iPlayerInfo[iSlot].iStats[ST_EXP], g_pConnection->Escape(engine->GetClientConVarValue(iSlot, "name")).c_str(), g_iPlayerInfo[iSlot].iStats[ST_RANK], g_iPlayerInfo[iSlot].iStats[ST_KILLS], g_iPlayerInfo[iSlot].iStats[ST_DEATHS], g_iPlayerInfo[iSlot].iStats[ST_SHOOTS], g_iPlayerInfo[iSlot].iStats[ST_HITS], g_iPlayerInfo[iSlot].iStats[ST_HEADSHOTS], g_iPlayerInfo[iSlot].iStats[ST_ASSISTS], g_iPlayerInfo[iSlot].iStats[ST_ROUNDSWIN], g_iPlayerInfo[iSlot].iStats[ST_ROUNDSLOSE], iTime-g_iPlayerInfo[iSlot].iStats[ST_PLAYTIME], iTime, g_Settings[LR_OnlineID]);
+		VALUES ('%s', %i, '%s', %i, %i, %i, %i, %i, %i, %i, %i, %i, %i, %i, %i);", g_sTableName, g_iPlayerInfo[iSlot].szAuth.c_str(), g_iPlayerInfo[iSlot].iStats[ST_EXP], g_pConnection->Escape(szName ? szName : "").c_str(), g_iPlayerInfo[iSlot].iStats[ST_RANK], g_iPlayerInfo[iSlot].iStats[ST_KILLS], g_iPlayerInfo[iSlot].iStats[ST_DEATHS], g_iPlayerInfo[iSlot].iStats[ST_SHOOTS], g_iPlayerInfo[iSlot].iStats[ST_HITS], g_iPlayerInfo[iSlot].iStats[ST_HEADSHOTS], g_iPlayerInfo[iSlot].iStats[ST_ASSISTS], g_iPlayerInfo[iSlot].iStats[ST_ROUNDSWIN], g_iPlayerInfo[iSlot].iStats[ST_ROUNDSLOSE], iTime-g_iPlayerInfo[iSlot].iStats[ST_PLAYTIME], iTime, g_Settings[LR_OnlineID]);
 
 		g_pConnection->Query(szQuery, [](ISQLQuery* test){});
 
@@ -510,7 +530,8 @@ void CheckAllowStatistic(bool bRoundStart = false)
 
 	bool bWarningMessage = iPlayers < g_Settings[LR_MinplayersCount];
 	
-	g_bAllowStatistic = !bWarningMessage && !(g_Settings[LR_BlockWarmup] && g_pGameRules->m_bWarmupPeriod());
+	// Without game rules (map change) the warmup state is unknown; block like warmup.
+	g_bAllowStatistic = !bWarningMessage && !(g_Settings[LR_BlockWarmup] && (!g_pGameRules || g_pGameRules->m_bWarmupPeriod()));
 
 	if(g_Settings[LR_ShowSpawnMessage] && bRoundStart)
 	{
@@ -648,7 +669,7 @@ void TopMenuHandle(const char* szBack, const char* szFront, int iItem, int iSlot
 void OverAllTopPlayers(int iSlot, bool bPlaytime = true)
 {
 	g_pMenus->ClosePlayerMenu(iSlot);
-	if(CheckStatus(iSlot))
+	if(g_pConnection && CheckStatus(iSlot))
 	{
 		char sQuery[256];
 
@@ -1087,12 +1108,19 @@ void MainMenuHandle(const char* szBack, const char* szFront, int iItem, int iSlo
 
 void OnLRMenu(int iSlot)
 {
-	int iRank = g_iPlayerInfo[iSlot].iStats[ST_RANK];
+	int iRank = g_iPlayerInfo[iSlot].iStats[ST_RANK],
+		iMaxRanks = g_hRankExp.size();
+
+	// A reload with fewer ranks leaves stale ranks until the next CheckRank().
+	if(iRank > iMaxRanks)
+		iRank = iMaxRanks;
+	else if(iRank < 0)
+		iRank = 0;
 
 	char sExp[32], sText[256], sBuffer[64];
 
 	Menu hMenu;
-	if(iRank == g_hRankExp.size())
+	if(iRank == iMaxRanks)
 	{
 		g_SMAPI->Format(sExp, sizeof(sExp), "%i", g_iPlayerInfo[iSlot].iStats[ST_EXP]);
 	}
@@ -1103,7 +1131,7 @@ void OnLRMenu(int iSlot)
 	
 	g_pMenus->SetTitleMenu(hMenu, g_sPluginTitle);
 
-	g_SMAPI->Format(sText, sizeof(sText), g_vecPhrases[std::string("MainMenuRank")].c_str(), g_vecPhrases[g_hRankNames[iRank ? iRank - 1 : 0]].c_str());
+	g_SMAPI->Format(sText, sizeof(sText), g_vecPhrases[std::string("MainMenuRank")].c_str(), iMaxRanks ? g_vecPhrases[g_hRankNames[iRank ? iRank - 1 : 0]].c_str() : "");
 	g_pMenus->AddItemMenu(hMenu, "", sText, ITEM_DISABLED);
 	g_SMAPI->Format(sText, sizeof(sText), g_vecPhrases[std::string("MainMenuExp")].c_str(), sExp);
 	g_pMenus->AddItemMenu(hMenu, "", sText, ITEM_DISABLED);
@@ -1152,8 +1180,10 @@ bool containsOnlyDigits(const std::string& str) {
 
 CON_COMMAND_F(mm_lvl_give_admin, "Give admin", FCVAR_GAMEDLL)
 {
-	if (args.ArgC() > 1 && containsOnlyDigits(args[1]))
+	if (args.ArgC() > 1 && args[1][0] && containsOnlyDigits(args[1]))
 	{
+		// std::stoll threw on numbers past LLONG_MAX; strtoull saturates instead.
+		uint64 iArg = std::strtoull(args[1], nullptr, 10);
 		bool bFound = false;
 		CCSPlayerController* pController;
 		int iSlot = 0;
@@ -1163,7 +1193,7 @@ CON_COMMAND_F(mm_lvl_give_admin, "Give admin", FCVAR_GAMEDLL)
 			if (!pController) continue;
 			uint32 m_steamID = pController->m_steamID();
 			if(m_steamID == 0) continue;
-			if(m_steamID == std::stoll(args[1]) || std::stoll(args[1]) == i || std::stoll(args[1]) == engine->GetClientXUID(i))
+			if(m_steamID == iArg || iArg == (uint64)i || iArg == engine->GetClientXUID(i))
 			{
 				bFound = true;
 				iSlot = i;
@@ -1304,6 +1334,9 @@ void LR::OnPluginUnload(PluginId id)
 void LR::OnClientDisconnect( CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 xuid, const char *pszNetworkID )
 {
 	int iSlot = slot.Get();
+	if (!IsValidSlot(iSlot))
+		return;
+
 	g_bAdminAccess[iSlot] = false;
 	if (!g_bDisabled)
 		SaveDataPlayer(iSlot, true);
@@ -1312,10 +1345,11 @@ void LR::OnClientDisconnect( CPlayerSlot slot, ENetworkDisconnectionReason reaso
 void LR::OnClientPutInServer(CPlayerSlot slot, char const *pszName, int type, uint64 xuid)
 {
 	int iSlot = slot.Get();
+	if (!IsValidSlot(iSlot))
+		return;
+
 	g_bAdminAccess[iSlot] = false;
 	g_iPlayerInfo[iSlot] = g_iInfoNULL;
-	if (iSlot == -1)
-    	return;
 	if (g_bDisabled || !g_pConnection)
 		return;
 
@@ -1324,6 +1358,8 @@ void LR::OnClientPutInServer(CPlayerSlot slot, char const *pszName, int type, ui
 		return;
 	
 	g_iPlayerInfo[iSlot].szAuth = ConvertSteamID(engine->GetPlayerNetworkIDString(iSlot));
+	if (g_iPlayerInfo[iSlot].szAuth.empty())
+		return;
 
 	char szQuery[512];
 	g_SMAPI->Format(szQuery, sizeof(szQuery), "SELECT `value`, `rank`, `kills`, `deaths`, `shoots`, `hits`, `headshots`, `assists`, `round_win`, `round_lose`, `playtime`, (SELECT COUNT(`steam`) FROM `%s` WHERE `value` >= `player`.`value` AND `lastconnect`) AS `exppos`, (SELECT COUNT(`steam`) FROM `%s` WHERE `playtime` >= `player`.`playtime` AND `lastconnect`) AS `timepos` FROM `%s` `player` WHERE `steam` = '%s' LIMIT 1;", g_sTableName, g_sTableName, g_sTableName, g_iPlayerInfo[iSlot].szAuth.c_str());
@@ -1348,7 +1384,8 @@ void LR::OnClientPutInServer(CPlayerSlot slot, char const *pszName, int type, ui
 		else
 		{
 			char szQuery[512];
-			g_SMAPI->Format(szQuery, sizeof(szQuery), "INSERT INTO `%s` (`steam`, `name`, `value`, `lastconnect`) VALUES ('%s', '%s', %i, %i);", g_sTableName, g_iPlayerInfo[iSlot].szAuth.c_str(), g_pConnection->Escape(engine->GetClientConVarValue(iSlot, "name")).c_str(), g_Settings[LR_TypeStatistics] ? 1000 : g_Settings[LR_StartPoints], std::time(0));
+			const char* szName = engine->GetClientConVarValue(iSlot, "name");
+			g_SMAPI->Format(szQuery, sizeof(szQuery), "INSERT INTO `%s` (`steam`, `name`, `value`, `lastconnect`) VALUES ('%s', '%s', %i, %i);", g_sTableName, g_iPlayerInfo[iSlot].szAuth.c_str(), g_pConnection->Escape(szName ? szName : "").c_str(), g_Settings[LR_TypeStatistics] ? 1000 : g_Settings[LR_StartPoints], std::time(0));
 			g_pConnection->Query(szQuery, [iSlot, this](ISQLQuery* test)
 			{
 				if(!g_iPlayerInfo[iSlot].bInitialized)
@@ -1372,6 +1409,9 @@ void LR::OnClientPutInServer(CPlayerSlot slot, char const *pszName, int type, ui
 
 void GiveExpForStreakKills(int iSlot)
 {
+	if (!IsValidSlot(iSlot))
+		return;
+
 	int iKillStreak = g_iPlayerInfo[iSlot].iKillStreak;
 	if(iKillStreak > 1)
 	{
@@ -1409,7 +1449,7 @@ void GiveExpForStreakKills(int iSlot)
 void OnOtherEvents(const char* sName, IGameEvent* event, bool bDontBroadcast)
 {
 	int iSlot = event->GetInt("userid");
-	if(iSlot < 64)
+	if(IsValidSlot(iSlot))
 	{
 		CBasePlayerController* pPlayerController = static_cast<CBasePlayerController*>(event->GetPlayerController("userid"));
 		if (pPlayerController)
@@ -1427,7 +1467,7 @@ void OnOtherEvents(const char* sName, IGameEvent* event, bool bDontBroadcast)
 				else
 				{
 					int iAttacker = event->GetInt("attacker");
-					if (iAttacker < 64)
+					if (IsValidSlot(iAttacker))
 					{
 						if(iAttacker != iSlot && g_iPlayerInfo[iAttacker].bInitialized)
 						{
@@ -1638,7 +1678,7 @@ void OnPlayerDeathEvent(const char* sName, IGameEvent* event, bool bDontBroadcas
 void OnBombEvent(const char* sName, IGameEvent* event, bool bDontBroadcast)
 {
 	int iSlot = event->GetInt("userid");
-	if (iSlot < 64)
+	if (IsValidSlot(iSlot))
 	{
 		if(sName[6] == 'e')
 		{
@@ -1670,7 +1710,8 @@ void OnBombEvent(const char* sName, IGameEvent* event, bool bDontBroadcast)
 
 void OnCleanDB()
 {
-	if(g_Settings[LR_CleanDB_Days])
+	// Utils may call the map-start callback before the connection exists.
+	if(g_pConnection && g_Settings[LR_CleanDB_Days])
 	{
 		char szQuery[256];
 		g_SMAPI->Format(szQuery, sizeof(szQuery), "UPDATE `%s` SET `lastconnect` = 0 WHERE `lastconnect` < %d AND `lastconnect`;", g_sTableName, std::time(0) - g_Settings[LR_CleanDB_Days] * 86400);
@@ -1868,11 +1909,13 @@ void LR::AllPluginsLoaded()
 	g_pUtils->HookEvent(g_PLID, "player_hurt", 	OnOtherEvents);
 
 	g_pUtils->RegCommand(g_PLID, {"mm_lvl", "sm_lvl"}, {"!lvl", "lvl", "!дмд", "дмд"}, [](int iSlot, const char* szContent){
+		if (!IsValidSlot(iSlot)) return false;
 		OnLRMenu(iSlot);
 		return false;
 	});
 
 	g_pUtils->RegCommand(g_PLID, {"mm_rank", "sm_rank"}, {"!rank", "rank", "!кфтл", "кфтл"}, [](int iSlot, const char* szContent){
+		if (!IsValidSlot(iSlot)) return false;
 		int iKills = g_iPlayerInfo[iSlot].iStats[ST_KILLS],
 			iDeaths = g_iPlayerInfo[iSlot].iStats[ST_DEATHS];
 
@@ -1903,11 +1946,13 @@ void LR::AllPluginsLoaded()
 	});
 
 	g_pUtils->RegCommand(g_PLID, {"mm_toptime", "sm_toptime"}, {"!toptime", "toptime", "!ещзешьу", "ещзешьу"}, [](int iSlot, const char* szContent){
+		if (!IsValidSlot(iSlot)) return false;
 		OverAllTopPlayers(iSlot);
 		return false;
 	});
 
 	g_pUtils->RegCommand(g_PLID, {"mm_top", "sm_top"}, {"!top", "top", "!ещз", "ещз"}, [](int iSlot, const char* szContent){
+		if (!IsValidSlot(iSlot)) return false;
 		OverAllTopPlayers(iSlot, false);
 		return false;
 	});
@@ -1957,6 +2002,8 @@ void LRApi::RoundWithoutValue()
 int LRApi::GetClientInfo(int iSlot, LR_StatsType StatsType, bool bSession)
 {
 	int iType = StatsType;
+	if (!IsValidSlot(iSlot) || iType < 0 || iType >= (int)std::size(g_iPlayerInfo[0].iStats))
+		return 0;
 	return bSession ? g_iPlayerInfo[iSlot].iSessionStats[iType] : g_iPlayerInfo[iSlot].iStats[iType];
 }
 
@@ -1967,17 +2014,24 @@ bool LRApi::CheckCountPlayers()
 
 bool LRApi::GetClientStatus(int iSlot)
 {
-	return g_iPlayerInfo[iSlot].bInitialized;
+	return IsValidSlot(iSlot) && g_iPlayerInfo[iSlot].bInitialized;
 }
 
 int LRApi::GetSettingsValue(LR_SettingType Setting)
 {
-	return g_Settings[Setting];
+	// The enum goes past the array (LR_ShowLevelUpMessage is 22 for modules).
+	int iSetting = Setting;
+	if (iSetting < 0 || iSetting >= (int)std::size(g_Settings))
+		return 0;
+	return g_Settings[iSetting];
 }
 
 int LRApi::GetSettingsStatsValue(LR_SettingStatsType Setting)
 {
-	return g_SettingsStats[Setting];
+	int iSetting = Setting;
+	if (iSetting < 0 || iSetting >= (int)std::size(g_SettingsStats))
+		return 0;
+	return g_SettingsStats[iSetting];
 }
 
 IMySQLConnection* LRApi::GetDatabases() {
